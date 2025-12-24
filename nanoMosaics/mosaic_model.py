@@ -20,6 +20,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from op import LeakyAvg
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -32,22 +33,22 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-class LeakyAvg(nn.Module):
-    def __init__(self, block_size, n_head):
-        super().__init__()
-        coef = torch.zeros(block_size, block_size)
-        for i in range(block_size):
-            coef = torch.diagonal_scatter(coef, -torch.ones(block_size-i)*i, -i)
-        self.register_buffer('coef', coef)
-        self.exp_scaling = 10
-        self.leaky_key_beta = nn.Parameter(torch.linspace(0.5, 5, n_head).view(1, n_head, 1, 1)/self.exp_scaling)
+# class LeakyAvg(nn.Module):
+#     def __init__(self, block_size, n_head):
+#         super().__init__()
+#         coef = torch.zeros(block_size, block_size)
+#         for i in range(block_size):
+#             coef = torch.diagonal_scatter(coef, -torch.ones(block_size-i)*i, -i)
+#         self.register_buffer('coef', coef)
+#         self.exp_scaling = 10
+#         self.leaky_key_beta = nn.Parameter(torch.linspace(0.5, 5, n_head).view(1, n_head, 1, 1)/self.exp_scaling)
 
-    def forward(self, k):
-        B, nh, T, hs = k.size()
-        leaky_key_beta = self.leaky_key_beta.abs() * self.exp_scaling
-        coef = self.coef[:T,:T].view(1,1,T,T)
-        coef = torch.exp(coef * leaky_key_beta)
-        return coef.tril() @ k
+#     def forward(self, k):
+#         B, nh, T, hs = k.size()
+#         leaky_key_beta = self.leaky_key_beta.abs() * self.exp_scaling
+#         coef = self.coef[:T,:T].view(1,1,T,T)
+#         coef = torch.exp(coef * leaky_key_beta)
+#         return coef.tril() @ k
 
 class KeyFeatureExtractor(nn.Module):
     def __init__(self, config):
@@ -55,7 +56,8 @@ class KeyFeatureExtractor(nn.Module):
         self.n_head = config.n_head
         self.leaky_cuda = config.leaky_cuda
         self.W_k = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        self.leaky_avg = LeakyAvg(config.block_size, config.n_head)
+        self.leaky_avg = LeakyAvg(config.n_head)
+        self.leaky_cuda
         self.exp_scaling = 10
         self.key_scale = nn.Parameter(torch.ones(1, config.n_head, 1, 1) / self.exp_scaling)
         self.key_scale_max = math.log(2**16-1) # fits in fp16.
@@ -360,3 +362,9 @@ class MemoryMosaic(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+    
+if __name__ == "__main__":
+    config = MemoryMosaicConfig()
+    net = MemoryMosaic(config).cuda().to(torch.bfloat16)
+    x = torch.ones((4, 1024),device="cuda").to(torch.long)
+    y = net(x)
