@@ -106,13 +106,8 @@ class ContextMem(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        assert hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         # causal mask to ensure that attention is only applied to the left in the input sequence
-        if not self.flash:
-            self.attn_dropout = nn.Dropout(config.dropout)
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size), diagonal=-1)
-                                    .view(1, 1, config.block_size, config.block_size).bool())
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -123,23 +118,13 @@ class ContextMem(nn.Module):
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         y = torch.zeros_like(v)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y[:, :, 1:] = torch.nn.functional.scaled_dot_product_attention(
+        y[:, :, 1:] = torch.nn.functional.scaled_dot_product_attention(
                 k[:, :, 1:],
                 k,
                 v,
-                attn_mask=self.bias[:, :, 1:T, :T],
                 dropout_p=self.dropout if self.training else 0,
                 scale=1
             )
-        else:
-            # manual implementation of attention
-            att = (k[:,:,1:] @ k.transpose(-2, -1))
-            att = att.masked_fill(~self.bias[:,:,1:T,:T], float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y[:, :, 1:] = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
@@ -169,11 +154,8 @@ class PersistentMem(nn.Module):
         self.dropout = config.dropout
         self.pmem_count = config.pmem_count
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        assert hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         # causal mask to ensure that attention is only applied to the left in the input sequence
-        if not self.flash:
-            self.attn_dropout = nn.Dropout(config.ic_dropout)
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -181,23 +163,16 @@ class PersistentMem(nn.Module):
         # calculate key, values for all heads in batch and move head forward to be the batch dim
         k = self.k_featurizer(x, scale_pow=2) # 2 because P_k does not have scale
 
-        if self.flash:
-            y = 0
-            for i in range(self.pmem_count):
-                y = y + F.scaled_dot_product_attention(
-                    k,
-                    self.P_k[i],
-                    self.P_v[i],
-                    scale=1,
-                    dropout_p=self.dropout if self.training else 0,
-                )
-        else:
-            # manual implementation of attention
-            for i in range(self.pmem_count):
-                att = k @ (self.P_k[i].transpose(-2, -1))
-                att = F.softmax(att, dim=-1)
-                att = self.attn_dropout(att)
-                y += att @ self.P_v[i] # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        
+        y = 0
+        for i in range(self.pmem_count):
+            y = y + F.scaled_dot_product_attention(
+                k,
+                self.P_k[i],
+                self.P_v[i],
+                scale=1,
+                dropout_p=self.dropout if self.training else 0,
+            )
 
         y = y / self.pmem_count
         y = y * (self.exp_scaling * self.out_scale).exp()
